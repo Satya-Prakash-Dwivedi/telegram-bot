@@ -1,16 +1,11 @@
 import os
-from dotenv import load_dotenv
-from datetime import datetime, timedelta
 import logging
 from datetime import datetime, timedelta, timezone
-
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
+from dotenv import load_dotenv
+from aiohttp import web
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    ApplicationBuilder,
+    Application,
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
@@ -24,170 +19,160 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 UPI_ID = os.getenv("UPI_ID")
 AMOUNT = os.getenv("AMOUNT", "499")
-CHANNEL_ID = os.getenv("CHANNEL_ID")           
-TARGET_CHANNEL_ID = os.getenv("TARGET_CHANNEL_ID")  
+CHANNEL_ID = os.getenv("CHANNEL_ID")
+TARGET_CHANNEL_ID = os.getenv("TARGET_CHANNEL_ID")
 ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID")) if os.getenv("ADMIN_USER_ID") else None
+APP_URL = os.getenv("APP_URL")
 
-# simple in-memory map: channel_message_id -> payer_user_id
-# (persists only while bot runs; add DB for persistence)
 proof_map = {}
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+# --- COMMAND HANDLERS ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Welcome! Type /pay to get UPI payment details.")
 
 
 async def pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = (
+    msg = (
         f"💰 *Payment Details:*\n\n"
         f"UPI ID: `{UPI_ID}`\n"
         f"Amount: ₹{AMOUNT}\n\n"
-        f"Pay on the above UPI id and share a full screenshot of the transaction."
+        "Pay on the above UPI ID and share a full screenshot of the transaction."
     )
-    await update.message.reply_text(message, parse_mode="Markdown")
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
 
 async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Receive screenshot from payer, post to channel with Accept/Decline buttons."""
     user = update.effective_user
     if not update.message or not update.message.photo:
-        await update.message.reply_text("Please send a photo (screenshot) of your payment.")
+        await update.message.reply_text("Please send a photo of your payment.")
         return
 
     photo = update.message.photo[-1]
-    file_id = photo.file_id
-
     caption = (
         f"🧾 *Payment proof received*\n\n"
         f"👤 Name: {user.full_name}\n"
         f"🆔 User ID: `{user.id}`\n"
-        f"🕒 {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} (UTC)\n"
+        f"🕒 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} (UTC)\n"
     )
 
-    # Inline buttons include encoded action + payer id so handlers can act
     accept_cb = f"action:accept|payer:{user.id}"
     decline_cb = f"action:decline|payer:{user.id}"
-    keyboard = InlineKeyboardMarkup(
-        [[
-            InlineKeyboardButton("✅ Accept", callback_data=accept_cb),
-            InlineKeyboardButton("❌ Decline", callback_data=decline_cb),
-        ]]
-    )
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Accept", callback_data=accept_cb),
+        InlineKeyboardButton("❌ Decline", callback_data=decline_cb),
+    ]])
 
-    # send photo to the moderator channel and capture resulting message id
     sent = await context.bot.send_photo(
         chat_id=CHANNEL_ID,
-        photo=file_id,
+        photo=photo.file_id,
         caption=caption,
         parse_mode="Markdown",
         reply_markup=keyboard,
     )
 
-    # map the channel message to payer id for later reference
-    proof_map[sent.message_id] = int(user.id)
-
-    await update.message.reply_text("✅ Payment proof received. Awaiting manual verification.")
+    proof_map[sent.message_id] = user.id
+    await update.message.reply_text("✅ Payment proof received. Awaiting admin verification.")
 
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle Accept/Decline presses by admin."""
     query = update.callback_query
-    await query.answer()  # acknowledge callback to Telegram
+    await query.answer()
 
-    user_who_pressed = query.from_user
-    if ADMIN_USER_ID and user_who_pressed.id != ADMIN_USER_ID:
+    if ADMIN_USER_ID and query.from_user.id != ADMIN_USER_ID:
         await query.reply_text("You are not authorized to approve payments.")
         return
 
-    data = query.data  # format: action:accept|payer:12345
-    # parse
-    parts = dict(part.split(":", 1) for part in data.split("|"))
-    action = parts.get("action")
-    payer_id = int(parts.get("payer"))
+    data = dict(part.split(":", 1) for part in query.data.split("|"))
+    action, payer_id = data["action"], int(data["payer"])
     channel_msg_id = query.message.message_id
 
     if action == "accept":
-        # create single-use invite link to TARGET_CHANNEL_ID
         try:
-            # expire in 1 hour (optional)
-            expire_ts = int((datetime.now(timezone.utc) + timedelta(hours=2)).timestamp())
+            expire_ts = int((datetime.now(timezone.utc) + timedelta(hours=1)).timestamp())
             link = await context.bot.create_chat_invite_link(
                 chat_id=TARGET_CHANNEL_ID,
                 member_limit=1,
-                expire_date=expire_ts
+                expire_date=expire_ts,
             )
             invite_url = link.invite_link
         except Exception as e:
-            logger.exception("Failed to create invite link")
+            logger.exception("Invite link creation failed")
             await query.edit_message_caption(
-                caption=query.message.caption + f"\n\n⚠️ Approval failed: could not create invite link.",
-                parse_mode="Markdown"
+                caption=query.message.caption + "\n\n⚠️ Failed to create invite link.",
+                parse_mode="Markdown",
             )
-            await query.reply_text("Failed to create invite link. Check bot permissions.")
             return
 
-        # notify the payer privately with the one-time link
         try:
             await context.bot.send_message(
                 chat_id=payer_id,
                 text=(
-                    "✅ Your payment has been *approved*.\n\n"
-                    f"Join the approved channel using this one-time link:\n{invite_url}\n\n"
-                    "Note: This link is single-use and will expire once used."
+                    "✅ Payment approved!\n\n"
+                    f"Join the private channel using this one-time link:\n{invite_url}\n\n"
+                    "_Expires in 1 hour or after one use._"
                 ),
-                parse_mode="Markdown"
+                parse_mode="Markdown",
             )
         except Exception as e:
-            logger.exception("Failed to send invite to payer")
-            # still proceed to update channel message
-            await query.reply_text("Approval done but failed to message the payer. They may not have started the bot.")
+            logger.warning("Could not message payer directly: %s", e)
 
-        # edit the channel post to mark approved
-        approved_by = user_who_pressed.full_name
-        new_caption = query.message.caption + f"\n\n✅ *Approved by:* {approved_by}"
-        await query.edit_message_caption(caption=new_caption, parse_mode="Markdown")
+        approved_by = query.from_user.full_name
+        await query.edit_message_caption(
+            caption=query.message.caption + f"\n\n✅ *Approved by:* {approved_by}",
+            parse_mode="Markdown",
+        )
 
     elif action == "decline":
-        declined_by = user_who_pressed.full_name
-        new_caption = query.message.caption + f"\n\n❌ *Declined by:* {declined_by}"
-        await query.edit_message_caption(caption=new_caption, parse_mode="Markdown")
-
-        # notify payer privately
+        declined_by = query.from_user.full_name
+        await query.edit_message_caption(
+            caption=query.message.caption + f"\n\n❌ *Declined by:* {declined_by}",
+            parse_mode="Markdown",
+        )
         try:
             await context.bot.send_message(
                 chat_id=payer_id,
-                text="❌ Your payment proof was *declined*. Please contact support or re-upload a valid proof.",
-                parse_mode="Markdown"
+                text="❌ Payment proof declined. Please contact support.",
             )
         except Exception:
             pass
 
-    # Optionally remove mapping
     proof_map.pop(channel_msg_id, None)
 
 
+# --- WEBHOOK SERVER ---
+async def webhook_handler(request):
+    data = await request.json()
+    await request.app["bot_app"].update_queue.put(data)
+    return web.Response(status=200)
+
+
+async def set_webhook(app):
+    webhook_url = f"{APP_URL}/webhook/{BOT_TOKEN}"
+    await app.bot.set_webhook(webhook_url)
+    logger.info(f"Webhook set to {webhook_url}")
+
+
 def main():
-    if not BOT_TOKEN:
-        logger.error("BOT_TOKEN missing in .env")
-        return
-    if not CHANNEL_ID or not TARGET_CHANNEL_ID:
-        logger.error("CHANNEL_ID or TARGET_CHANNEL_ID missing in .env")
-        return
-    if not ADMIN_USER_ID:
-        logger.warning("ADMIN_USER_ID missing. Any user can press approve buttons.")
+    if not BOT_TOKEN or not APP_URL:
+        raise ValueError("Missing BOT_TOKEN or APP_URL in environment")
 
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    bot_app = Application.builder().token(BOT_TOKEN).build()
+    bot_app.add_handler(CommandHandler("start", start))
+    bot_app.add_handler(CommandHandler("pay", pay))
+    bot_app.add_handler(MessageHandler(filters.PHOTO, handle_image))
+    bot_app.add_handler(CallbackQueryHandler(callback_handler))
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("pay", pay))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_image))
-    app.add_handler(CallbackQueryHandler(callback_handler))
+    web_app = web.Application()
+    web_app["bot_app"] = bot_app
+    web_app.router.add_post(f"/webhook/{BOT_TOKEN}", webhook_handler)
 
-    logger.info("Bot started")
-    app.run_polling()
+    web_app.on_startup.append(lambda _: set_webhook(bot_app))
+
+    port = int(os.getenv("PORT", 8000))
+    web.run_app(web_app, port=port)
 
 
 if __name__ == "__main__":

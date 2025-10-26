@@ -13,6 +13,7 @@ from telegram.ext import (
     filters,
 )
 
+# Load environment variables
 load_dotenv()
 
 # Config
@@ -24,12 +25,15 @@ TARGET_CHANNEL_ID = os.getenv("TARGET_CHANNEL_ID")
 ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID")) if os.getenv("ADMIN_USER_ID") else None
 APP_URL = os.getenv("APP_URL")
 
+# Simple in-memory map
 proof_map = {}
+
+# Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-# --- COMMAND HANDLERS ---
+# --- Command Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Welcome! Type /pay to get UPI payment details.")
 
@@ -60,10 +64,12 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     accept_cb = f"action:accept|payer:{user.id}"
     decline_cb = f"action:decline|payer:{user.id}"
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Accept", callback_data=accept_cb),
-        InlineKeyboardButton("❌ Decline", callback_data=decline_cb),
-    ]])
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Accept", callback_data=accept_cb),
+            InlineKeyboardButton("❌ Decline", callback_data=decline_cb),
+        ]
+    ])
 
     sent = await context.bot.send_photo(
         chat_id=CHANNEL_ID,
@@ -142,7 +148,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     proof_map.pop(channel_msg_id, None)
 
 
-# --- WEBHOOK SERVER ---
+# --- Webhook Server ---
 async def webhook_handler(request):
     data = await request.json()
     await request.app["bot_app"].update_queue.put(data)
@@ -151,7 +157,7 @@ async def webhook_handler(request):
 
 async def set_webhook(app):
     webhook_url = f"{APP_URL}/webhook/{BOT_TOKEN}"
-    await app.bot.set_webhook(webhook_url)
+    await app["bot_app"].bot.set_webhook(webhook_url)
     logger.info(f"Webhook set to {webhook_url}")
 
 
@@ -169,7 +175,17 @@ def main():
     web_app["bot_app"] = bot_app
     web_app.router.add_post(f"/webhook/{BOT_TOKEN}", webhook_handler)
 
-    web_app.on_startup.append(lambda _: set_webhook(bot_app))
+    async def on_startup(app):
+        await bot_app.initialize()
+        await bot_app.start()
+        await set_webhook(app)
+
+    async def on_shutdown(app):
+        await bot_app.stop()
+        await bot_app.shutdown()
+
+    web_app.on_startup.append(on_startup)
+    web_app.on_shutdown.append(on_shutdown)
 
     port = int(os.getenv("PORT", 8000))
     web.run_app(web_app, port=port)

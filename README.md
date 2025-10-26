@@ -53,6 +53,6 @@ A simple Telegram bot built with **Python** and **python-telegram-bot** that hel
 BOT_TOKEN=your_bot_token_here
 UPI_ID=your_upi_id_here
 PAYEE_NAME=your_name_here
-AMOUNT=499
+AMOUNT=amount
 ADMIN_CHAT_ID=your_admin_user_id
 CHANNEL_ID=your_admin_channel_id

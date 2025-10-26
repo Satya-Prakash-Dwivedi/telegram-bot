@@ -2,6 +2,7 @@ import os
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
 import logging
+from datetime import datetime, timedelta, timezone
 
 from telegram import (
     Update,
@@ -112,7 +113,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # create single-use invite link to TARGET_CHANNEL_ID
         try:
             # expire in 1 hour (optional)
-            expire_ts = None  # or datetime.utcnow() + timedelta(hours=1)
+            expire_ts = int((datetime.now(timezone.utc) + timedelta(hours=2)).timestamp())
             link = await context.bot.create_chat_invite_link(
                 chat_id=TARGET_CHANNEL_ID,
                 member_limit=1,

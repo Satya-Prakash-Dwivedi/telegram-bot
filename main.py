@@ -151,13 +151,18 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- Webhook Server ---
 async def webhook_handler(request):
     data = await request.json()
-    await request.app["bot_app"].update_queue.put(data)
+    update = Update.de_json(data, request.app["bot_app"].bot)
+    await request.app["bot_app"].process_update(update)
     return web.Response(status=200)
 
 
-async def set_webhook(app):
+async def healthcheck(request):
+    return web.Response(text="Bot is running.")
+
+
+async def set_webhook(bot_app):
     webhook_url = f"{APP_URL}/webhook/{BOT_TOKEN}"
-    await app["bot_app"].bot.set_webhook(webhook_url)
+    await bot_app.bot.set_webhook(webhook_url)
     logger.info(f"Webhook set to {webhook_url}")
 
 
@@ -173,12 +178,13 @@ def main():
 
     web_app = web.Application()
     web_app["bot_app"] = bot_app
+    web_app.router.add_get("/", healthcheck)
     web_app.router.add_post(f"/webhook/{BOT_TOKEN}", webhook_handler)
 
     async def on_startup(app):
         await bot_app.initialize()
         await bot_app.start()
-        await set_webhook(app)
+        await set_webhook(bot_app)
 
     async def on_shutdown(app):
         await bot_app.stop()
